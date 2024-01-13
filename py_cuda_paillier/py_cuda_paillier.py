@@ -1,10 +1,10 @@
 """Paillier encryption library for partially homomorphic encryption."""
 
-from py_cuda_paillier.util import Euclid, PrimeDigit, check_plaintext
+from util import Euclid, PrimeDigit, check_plaintext
 from numba import cuda
 from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_uniform_float64
 import numpy as np
-
+import time
 DEFAULT_BIT_KEY_LENGTH = 12
 
 
@@ -90,6 +90,22 @@ class PaillierPublicKey(object):
         """
         print(f"public_key: {self.n}, {self.g}")
 
+    @staticmethod
+    def naive_pow(a:int, b:int, m:int):
+        a_pow = a
+        i = 1
+        while i != b:
+            a_pow = a_pow * a % m
+            i += 1
+        return a_pow
+
+    def calculation_cipher_text_naive(self, g:int, m:int, r:int, n:int):
+        # 求 (g^m*r^n) % (n^2)
+        n_square = n * n
+        g_pow = self.naive_pow(g, m, n_square)
+        r_pow = self.naive_pow(r, n, n_square)
+        return (g_pow * r_pow) % n_square
+        
     def encryption(self, plaintext_as_digits_list: [int], don_t_use_r: bool = False):
         """Encryption function of plain text presented as a list of unencrypted numbers.
 
@@ -106,17 +122,57 @@ class PaillierPublicKey(object):
         if plaintext_is_current:
             encrypt_text_as_digits_list = []
             if don_t_use_r:
+                t1 = time.time()
                 for digit in plaintext_as_digits_list:
                     encrypt_text_as_digits_list.append(
-                        ((self.g ** digit) * (1 ** self.n)) % self.n_square
+                        pow(self.g, digit, self.n_square) % self.n_square
                     )
+                t2 = time.time()
             else:
+                t1 = time.time()
                 for digit in plaintext_as_digits_list:
-                    r = PrimeDigit().gen_mutually(self.n)
+                    r = PrimeDigit().generating_a_large_prime_modulo(self.n)
                     encrypt_text_as_digits_list.append(
-                        ((self.g ** digit) * (r ** self.n)) % self.n_square
+                        (pow(self.g, digit, self.n_square) * pow(r, self.n, self.n_square)) % self.n_square
+                        # ((self.g ** digit) * (r ** self.n)) % self.n_square
                     )
-            return encrypt_text_as_digits_list
+                t2 = time.time()
+                
+            return encrypt_text_as_digits_list, t2-t1
+        else:
+            return [] 
+
+    def encryption_naive(self, plaintext_as_digits_list: [int], don_t_use_r: bool = False):
+        """Encryption function of plain text presented as a list of unencrypted numbers.
+
+        :param plaintext_as_digits_list: (list[int]) - list of unencrypted numbers
+        :param don_t_use_r: (bool) optional, used for homomorphic encryption function
+        :return: empty list [] or non-empty list including encrypted digits
+        """
+        if not isinstance(don_t_use_r, bool):
+            print("The parameter 'don_t_use_r' did not match a boolean type, so its value was set to False.")
+            don_t_use_r = False
+        plaintext_is_current: bool = check_plaintext(
+            plaintext_as_digits_list, self.n
+        )
+        if plaintext_is_current:
+            encrypt_text_as_digits_list = []
+            if don_t_use_r:
+                t1 = time.time()
+                for digit in plaintext_as_digits_list:
+                    encrypt_text_as_digits_list.append(
+                        self.calculation_cipher_text_naive(self.g, digit, 1, self.n)
+                    )
+                t2 = time.time()
+            else:
+                t1 = time.time()
+                for digit in plaintext_as_digits_list:
+                    r = PrimeDigit().generating_a_large_prime_modulo(self.n)
+                    encrypt_text_as_digits_list.append(
+                        self.calculation_cipher_text_naive(self.g, digit, r, self.n)
+                    )
+                t2 = time.time()
+            return encrypt_text_as_digits_list, t2-t1
         else:
             return []
 
@@ -149,8 +205,11 @@ class PaillierPublicKey(object):
             g_pow = g
             mod = n_square
             i = 1
+            # 疑问：cuda是不支持直接 ** 做乘方吗
+            # print("calculating g^m")
             while i != np_plaintext[thread_id]:
                 g_pow = g_pow * g
+                # 其实是利用了 (a*b) mod c = ((a mod c)*b) mod c
                 if g_pow > mod:
                     g_pow = g_pow % mod
                 i += 1
@@ -158,6 +217,7 @@ class PaillierPublicKey(object):
             r_pow = _np_randoms[thread_id]
             mod = n_square
             i = 1
+            # print("calculating r^n")
             while i != n:
                 r_pow = r_pow * _np_randoms[thread_id]
                 if r_pow > mod:
@@ -208,25 +268,135 @@ class PaillierPublicKey(object):
             device_nnp_randoms = cuda.to_device(np_randoms)
             device_np_plaintext_as_dl = cuda.to_device(np_plaintext_as_dl)
             device_np_enc_text = cuda.to_device(np_enc_text)
-
             # encrypt
+            t1 = time.time()
             calculation[cuda_config.blocks, cuda_config.threads_per_block](
                 self.n, self.g, self.n_square,
                 device_nnp_randoms,
                 device_np_plaintext_as_dl,
                 device_np_enc_text
             )
-
+            t2 = time.time()
             # copy array to host
             host_enc_text = device_np_enc_text.copy_to_host()
             cuda.close()
 
             # change types
             encrypt_text_as_digits_list = host_enc_text.astype(int).tolist()
-            return encrypt_text_as_digits_list
+            return encrypt_text_as_digits_list, t2-t1
         else:
             return []
 
+    def cuda_plus_encryption(
+            self, plaintext_as_digits_list: [int],
+            cuda_config: CudaConfig, don_t_use_r: bool = False
+    ):
+        """Encryption function of plaintext represented as a list of numbers using the GPU.
+
+        :param plaintext_as_digits_list: (list[int]) - list of unencrypted numbers
+        :param cuda_config: (list[int, int]) - parameters for GPU
+        :param don_t_use_r: (bool) optional, used for homomorphic encryption function
+        :return: empty list [] or non-empty list including encrypted digits
+        """
+        @cuda.jit
+        def rand_array(p: int, q: int, _rng_states, out: np.ndarray):
+            thread_id = cuda.grid(1)
+            x = xoroshiro128p_uniform_float64(_rng_states, thread_id) * 100000
+            while int(x) % p == 0 or int(x) % q == 0 or int(x) > (p * q):
+                x = xoroshiro128p_uniform_float64(_rng_states, thread_id) * 100000
+            out[thread_id] = x
+
+        @cuda.jit
+        def calculation_plus(
+                n: int, g: int, n_square: int, _np_randoms: np.ndarray,
+                np_plaintext: np.ndarray, _np_enc_text: np.ndarray
+        ):
+            thread_id = cuda.grid(1) 
+            m = np_plaintext[thread_id]
+            r = _np_randoms[thread_id]
+            mod = n_square
+            # print("calculating g^m%mod")
+            result1 = 1
+            g_copy = g
+            while m > 1:
+                if m % 2 == 1:
+                    result1 = result1 * g_copy % mod
+                g_copy = g_copy * g_copy % mod
+                m = m // 2
+            result1 = result1 * g_copy % mod
+
+            # print("calculating r^n")
+            result2 = 1
+            n_copy = n
+            while n_copy > 1:
+                if n_copy % 2 == 1:
+                    result2 = result2 * r % mod
+                r = r * r % mod
+                n_copy = n_copy // 2
+            result2 = result2 * r % mod         
+            
+            _np_enc_text[thread_id] = (result1 * result2) % mod
+
+        if not isinstance(don_t_use_r, bool):
+            print("The parameter 'don_t_use_r' did not match a boolean type, so its value was set to False.")
+            don_t_use_r = False
+        if not isinstance(cuda_config, CudaConfig):
+            print("The parameter 'cuda_config' did not match a boolean type, so its value was set to [1, 1].")
+            cuda_config = CudaConfig(1, 1)
+        plaintext_is_current: bool = check_plaintext(
+            plaintext_as_digits_list, self.n
+        )
+        if plaintext_is_current:
+            randoms = np.ones(len(plaintext_as_digits_list), dtype=np.uint64)
+            # generate randoms digits with cuda
+            if not don_t_use_r:
+                # generate states
+                rng_states = create_xoroshiro128p_states(len(plaintext_as_digits_list), seed=1)
+                # create numpy array for random
+                np_randoms = np.ones(len(plaintext_as_digits_list), dtype=np.float64)
+                # copy array to GPU
+                device_np_randoms = cuda.to_device(np_randoms)
+                # generate randoms
+                rand_array[cuda_config.blocks, cuda_config.threads_per_block](
+                    self.__p, self.__q,
+                    rng_states,
+                    device_np_randoms
+                )
+                # copy array to CPU
+                host_np_randoms = device_np_randoms.copy_to_host()
+                cuda.close()
+                # transfer from numpy
+                randoms = host_np_randoms.astype(int).tolist()
+            # encryption part
+            # transfer plaintext to numpy array
+            np_plaintext_as_dl = np.array(plaintext_as_digits_list, dtype=np.uint64)
+            np_randoms = np.array(randoms, dtype=np.uint64)
+
+            # create numpy array for encrypt text
+            np_enc_text = np.ones_like(np_plaintext_as_dl, dtype=np.uint64)
+
+            # copy numpy arrays to GPU
+            device_nnp_randoms = cuda.to_device(np_randoms)
+            device_np_plaintext_as_dl = cuda.to_device(np_plaintext_as_dl)
+            device_np_enc_text = cuda.to_device(np_enc_text)
+            # encrypt
+            t1 = time.time()
+            calculation_plus[cuda_config.blocks, cuda_config.threads_per_block](
+                self.n, self.g, self.n_square,
+                device_nnp_randoms,
+                device_np_plaintext_as_dl,
+                device_np_enc_text
+            )
+            t2 = time.time()
+            # copy array to host
+            host_enc_text = device_np_enc_text.copy_to_host()
+            cuda.close()
+
+            # change types
+            encrypt_text_as_digits_list = host_enc_text.astype(int).tolist()
+            return encrypt_text_as_digits_list, t2-t1
+        else:
+            return []
 
 class PaillierPrivateKey(object):
     """Contains a private key and associated decryption method.
@@ -251,9 +421,9 @@ class PaillierPrivateKey(object):
             self.__q = q
         else:
             print("The input data (public_key, p or q) is of an invalid type.")
-            self.__public_key: PaillierPublicKey = PaillierPublicKey(1517, 41, 38)
+            self.__public_key: PaillierPublicKey = PaillierPublicKey(1517, 41, 37)
             self.__p = 41
-            self.__q = 38
+            self.__q = 37
 
         self.lambdas = self.generation_lambdas(self.__p, self.__q)
         self.mu = self.generation_mu(self.__public_key.g, self.__public_key.n, self.lambdas)
@@ -290,6 +460,15 @@ class PaillierPrivateKey(object):
         """
         print(f"private_key: {self.lambdas}, {self.mu}")
 
+    @staticmethod
+    def naive_pow(a:int, b:int, m:int):
+        a_pow = a
+        i = 1
+        while i != b:
+            a_pow = a_pow * a % m
+            i += 1
+        return a_pow
+    
     def decryption(self, encryption_digits_list: [int]):
         """Function for decrypting a list of encrypted numbers.
 
@@ -297,6 +476,7 @@ class PaillierPrivateKey(object):
         :return: list [int] - list of decrypted numbers
         """
         decrypt_text = []
+        t1 = time.time()
         for encrypt_digit in encryption_digits_list:
             decrypt_digit = (
                     (l_func(
@@ -305,8 +485,68 @@ class PaillierPrivateKey(object):
                     ) * self.mu) % self.__public_key.n
             )
             decrypt_text.append(decrypt_digit)
+        t2 = time.time()
+        return decrypt_text, t2-t1
 
-        return decrypt_text
+    def decryption_naive(self, encryption_digits_list: [int]):
+        """Function for decrypting a list of encrypted numbers.
+
+        :param encryption_digits_list: list [int] - list of encrypted numbers
+        :return: list [int] - list of decrypted numbers
+        """
+        decrypt_text = []
+        t1 = time.time()
+        for encrypt_digit in encryption_digits_list:
+            decrypt_digit = (
+                    (l_func(
+                        self.naive_pow(encrypt_digit, self.lambdas, self.__public_key.n_square),
+                        self.__public_key.n
+                    ) * self.mu) % self.__public_key.n
+            )
+            decrypt_text.append(decrypt_digit)
+        t2 = time.time()
+        return decrypt_text, t2-t1
+
+    def cuda_test_decryption(self, encryption_digits_list: [int], cuda_config: CudaConfig):
+        """Function for decrypting a list of encrypted numbers with GPU.
+
+        :param encryption_digits_list: (list [int]) - list of encrypted numbers
+        :param cuda_config: (list[int, int]) - parameters for GPU
+        :return: list [int] - list of decrypted numbers
+        """
+        @cuda.jit
+        def calculation(
+                lambdas, mu, n, n_square,
+                enc_text, dec_text
+        ):
+            thread_id = cuda.grid(1)
+
+            mod = n_square
+            
+            pow_enc_text = pow(enc_text[thread_id], lambdas) % mod
+            res_l_func = (pow_enc_text - 1) // n
+
+            dec_text[thread_id] = (res_l_func * mu) % n
+
+        if not isinstance(cuda_config, CudaConfig):
+            print("The parameter 'cuda_config' did not match a boolean type, so its value was set to [1, 1].")
+            cuda_config = CudaConfig(1, 1)
+
+        np_encryption_digits_list = np.array(encryption_digits_list, dtype=np.uint64)
+        device_np_enc_dl = cuda.to_device(np_encryption_digits_list)
+
+        np_decrypt_text = np.ones_like(np_encryption_digits_list)
+        device_decrypt_text = cuda.to_device(np_decrypt_text)
+        t1 = time.time()
+        calculation[cuda_config.blocks, cuda_config.threads_per_block](
+            self.lambdas, self.mu, self.__public_key.n, self.__public_key.n_square,
+            device_np_enc_dl, device_decrypt_text
+        )
+        t2 = time.time()
+        np_decrypt_text = device_decrypt_text.copy_to_host()
+        decrypt_text = np_decrypt_text.astype(int).tolist()
+
+        return decrypt_text, t2-t1
 
     def cuda_decryption(self, encryption_digits_list: [int], cuda_config: CudaConfig):
         """Function for decrypting a list of encrypted numbers with GPU.
@@ -344,17 +584,65 @@ class PaillierPrivateKey(object):
 
         np_decrypt_text = np.ones_like(np_encryption_digits_list)
         device_decrypt_text = cuda.to_device(np_decrypt_text)
-
+        t1 = time.time()
         calculation[cuda_config.blocks, cuda_config.threads_per_block](
             self.lambdas, self.mu, self.__public_key.n, self.__public_key.n_square,
             device_np_enc_dl, device_decrypt_text
         )
-
+        t2 = time.time()
         np_decrypt_text = device_decrypt_text.copy_to_host()
         decrypt_text = np_decrypt_text.astype(int).tolist()
 
-        return decrypt_text
+        return decrypt_text, t2-t1
 
+    def cuda_plus_decryption(self, encryption_digits_list: [int], cuda_config: CudaConfig):
+        """Function for decrypting a list of encrypted numbers with GPU.
+
+        :param encryption_digits_list: (list [int]) - list of encrypted numbers
+        :param cuda_config: (list[int, int]) - parameters for GPU
+        :return: list [int] - list of decrypted numbers
+        """
+        @cuda.jit
+        def calculation(
+                lambdas, mu, n, n_square,
+                enc_text, dec_text
+        ):
+            thread_id = cuda.grid(1)
+
+            c = enc_text[thread_id]
+            mod = n_square
+            result = 1
+            # 求 c^lambdas
+            # pow_enc_text = pow(enc_text[thread_id], lambdas) % n_square
+            while lambdas > 1:
+                if lambdas % 2 == 1:
+                    result = result * c % mod
+                c = c * c % mod
+                lambdas = lambdas // 2
+            result = result * c % mod
+            res_l_func = (result - 1) // n
+
+            dec_text[thread_id] = (res_l_func * mu) % n
+
+        if not isinstance(cuda_config, CudaConfig):
+            print("The parameter 'cuda_config' did not match a boolean type, so its value was set to [1, 1].")
+            cuda_config = CudaConfig(1, 1)
+
+        np_encryption_digits_list = np.array(encryption_digits_list, dtype=np.uint64)
+        device_np_enc_dl = cuda.to_device(np_encryption_digits_list)
+
+        np_decrypt_text = np.ones_like(np_encryption_digits_list)
+        device_decrypt_text = cuda.to_device(np_decrypt_text)
+        t1 = time.time()
+        calculation[cuda_config.blocks, cuda_config.threads_per_block](
+            self.lambdas, self.mu, self.__public_key.n, self.__public_key.n_square,
+            device_np_enc_dl, device_decrypt_text
+        )
+        t2 = time.time()
+        np_decrypt_text = device_decrypt_text.copy_to_host()
+        decrypt_text = np_decrypt_text.astype(int).tolist()
+
+        return decrypt_text, t2-t1
 
 class PaillierKeyPairGenerator(object):
     """Class includes function for generation public and private keys.
@@ -418,8 +706,8 @@ class PaillierKeyPairGenerator(object):
             print("Parameter 'p' must be type 'int', set value 41.")
             p = 41
         if not isinstance(q, int):
-            print("Parameter 'q' must be type 'int', set value 38.")
-            q = 38
+            print("Parameter 'q' must be type 'int', set value 37.")
+            q = 37
 
         n = p * q
 
@@ -484,10 +772,11 @@ class Homomorphic(PaillierPublicKey):
         if not self.comparison_of_text_lengths(first_encrypt_text_as_digits_list, second_encrypt_text_as_digits_list):
             print("An empty list will be returned to you.")
         else:
+            t1 = time.time()
             for i in range(len(first_encrypt_text_as_digits_list)):
-                addition.append(
-                    (first_encrypt_text_as_digits_list[i] * second_encrypt_text_as_digits_list[i]) % self.n_square
-                )
+                addition.append((first_encrypt_text_as_digits_list[i] * second_encrypt_text_as_digits_list[i]) % self.n_square)
+            t2 = time.time()
+            print(f"{len(first_encrypt_text_as_digits_list)}次计算串行总耗时{t2-t1} s")
         return addition
 
     def cuda_addition_of_two_ciphertexts(
@@ -517,7 +806,7 @@ class Homomorphic(PaillierPublicKey):
         if not self.comparison_of_text_lengths(first_encrypt_text_as_digits_list, second_encrypt_text_as_digits_list):
             print("An empty list will be returned to you.")
         else:
-
+            t1 = time.time()
             np_addition = np.ones(len(first_encrypt_text_as_digits_list), dtype=np.uint64)
             np_first_enc = np.array(first_encrypt_text_as_digits_list, dtype=np.uint64)
             np_second_enc = np.array(second_encrypt_text_as_digits_list, dtype=np.uint64)
@@ -526,17 +815,18 @@ class Homomorphic(PaillierPublicKey):
             device_np_addition = cuda.to_device(np_addition)
             device_np_first_enc = cuda.to_device(np_first_enc)
             device_np_second_enc = cuda.to_device(np_second_enc)
-
+            t2 = time.time()
             calculation[cuda_config.blocks, cuda_config.threads_per_block](
                 self.n_square, device_np_first_enc,
                 device_np_second_enc, device_np_addition
             )
-
+            t3 = time.time()
             host_np_addition = device_np_addition.copy_to_host()
             addition = host_np_addition.astype(int).tolist()
-
+            t4 = time.time()
+            print(f"compute_time: {t3-t2}, copy_time: {t4-t3+t2-t1}", f"并行消耗时间 {t4-t1} s")
         return addition
-
+    
     def addition_of_cipher_and_plaintext_via_g(
             self,
             first_encrypt_text_as_digits_list: [int],
